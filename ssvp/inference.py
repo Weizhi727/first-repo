@@ -5,14 +5,29 @@ Run zero-shot anomaly detection on one or more images using the SSVP model.
 
 Usage
 -----
+    # Download backbones automatically
     python ssvp/inference.py \\
         --images path/to/img1.jpg path/to/img2.png \\
         --class-name transistor \\
-        --output-dir results/ \\
-        [--clip-model ViT-B/16] \\
-        [--dino-model dinov2_vitb14] \\
-        [--checkpoint path/to/ssvp_weights.pt] \\
-        [--device cuda]
+        --output-dir results/
+
+    # Use local CLIP + DINOv2/v3 checkpoints (no internet required)
+    python ssvp/inference.py \\
+        --images path/to/img1.jpg \\
+        --class-name transistor \\
+        --clip-ckpt /path/to/ViT-B-16.pt \\
+        --dino-ckpt /path/to/dinov3_vitb14.pth \\
+        --clip-model ViT-B/16 \\
+        --dino-model dinov2_vitb14 \\
+        --checkpoint path/to/ssvp_weights.pt
+
+Local checkpoint formats supported
+------------------------------------
+CLIP  : raw .pt file produced by openai/CLIP (same format as the official release)
+DINOv2/v3 : any of —
+  • full serialised model  : torch.save(model, ...)
+  • state_dict             : torch.save(model.state_dict(), ...)
+  • wrapped dict           : {"model": state_dict}  or  {"state_dict": state_dict}
 
 Requirements
 ------------
@@ -62,16 +77,95 @@ def build_transforms(image_size: int = 518):
 # Model loading
 # ---------------------------------------------------------------------------
 
-def load_clip(model_name: str, device: torch.device):
+def load_clip(
+    model_name: str,
+    device: torch.device,
+    local_ckpt: str | None = None,
+) -> nn.Module:
+    """
+    Load a CLIP model.
+
+    If *local_ckpt* is given it is passed directly to ``clip.load()`` as the
+    model path — the openai/CLIP library accepts both hub model names and
+    local ``.pt`` file paths via the same argument.
+
+    Args:
+        model_name:  Hub variant used only to infer feature dimensions when
+                     *local_ckpt* is also supplied (e.g. ``"ViT-B/16"``).
+        device:      Target device.
+        local_ckpt:  Optional path to a local CLIP ``.pt`` file.
+    """
     import clip as openai_clip
-    model, _ = openai_clip.load(model_name, device=device)
+
+    load_arg = local_ckpt if local_ckpt else model_name
+    model, _ = openai_clip.load(load_arg, device=device)
     model.eval()
+    if local_ckpt:
+        print(f"[info] Loaded CLIP from local checkpoint: {local_ckpt}")
     return model
 
 
-def load_dino(model_name: str, device: torch.device):
-    model = torch.hub.load("facebookresearch/dinov2", model_name)
+def load_dino(
+    model_name: str,
+    device: torch.device,
+    local_ckpt: str | None = None,
+) -> nn.Module:
+    """
+    Load a DINOv2 / DINOv3 model.
+
+    Without *local_ckpt*: downloads from ``facebookresearch/dinov2`` hub.
+
+    With *local_ckpt*: inspects the file format and handles three cases:
+      1. Full serialised ``nn.Module``  → loaded directly.
+      2. Plain ``state_dict``           → architecture created from hub
+         (pretrained=False) then weights loaded.
+      3. Wrapped dict ``{"model": ...}`` or ``{"state_dict": ...}``
+         → same as case 2 after unwrapping.
+
+    Args:
+        model_name:  Hub model name used to build the architecture when a
+                     bare state_dict is provided (e.g. ``"dinov2_vitb14"``).
+        device:      Target device.
+        local_ckpt:  Optional path to a local ``.pth`` / ``.pt`` file.
+    """
+    if local_ckpt is None:
+        model = torch.hub.load("facebookresearch/dinov2", model_name)
+        model.eval().to(device)
+        return model
+
+    checkpoint = torch.load(local_ckpt, map_location=device)
+
+    # Case 1: full serialised model
+    if isinstance(checkpoint, nn.Module):
+        model = checkpoint.eval().to(device)
+        print(f"[info] Loaded DINOv3 full model from: {local_ckpt}")
+        return model
+
+    # Cases 2 & 3: state_dict (optionally wrapped)
+    if isinstance(checkpoint, dict):
+        state_dict = (
+            checkpoint.get("model")
+            or checkpoint.get("state_dict")
+            or checkpoint          # assume the dict itself is a state_dict
+        )
+    else:
+        raise ValueError(
+            f"Unrecognised checkpoint format in {local_ckpt}: "
+            f"expected nn.Module or dict, got {type(checkpoint)}"
+        )
+
+    # Build architecture skeleton without pretrained weights
+    model = torch.hub.load(
+        "facebookresearch/dinov2", model_name, pretrained=False
+    )
+    missing, unexpected = model.load_state_dict(state_dict, strict=False)
+    if missing:
+        print(f"[warn] DINOv3 missing keys ({len(missing)}): {missing[:3]}{'…' if len(missing) > 3 else ''}")
+    if unexpected:
+        print(f"[warn] DINOv3 unexpected keys ({len(unexpected)}): {unexpected[:3]}{'…' if len(unexpected) > 3 else ''}")
+
     model.eval().to(device)
+    print(f"[info] Loaded DINOv3 weights from: {local_ckpt}")
     return model
 
 
@@ -80,10 +174,12 @@ def build_model(
     dino_name: str,
     checkpoint: str | None,
     device: torch.device,
+    clip_ckpt: str | None = None,
+    dino_ckpt: str | None = None,
 ) -> SSVP:
     """Instantiate SSVP and optionally load a checkpoint."""
-    clip_model = load_clip(clip_name, device)
-    dino_model = load_dino(dino_name, device)
+    clip_model = load_clip(clip_name, device, local_ckpt=clip_ckpt)
+    dino_model = load_dino(dino_name, device, local_ckpt=dino_ckpt)
 
     # Infer dims from model names
     clip_dim = 768 if "L" in clip_name else 512
@@ -154,9 +250,11 @@ def parse_args():
     p.add_argument("--class-name", default="object", help="Object category (inserted into prompts)")
     p.add_argument("--output-dir", default="results", help="Directory for output images and scores")
     p.add_argument("--image-size", type=int, default=518, help="Input resolution (square)")
-    p.add_argument("--clip-model", default="ViT-B/16", help="CLIP model variant")
-    p.add_argument("--dino-model", default="dinov2_vitb14", help="DINOv2 model variant")
-    p.add_argument("--checkpoint", default=None, help="Path to SSVP checkpoint (.pt)")
+    p.add_argument("--clip-model", default="ViT-B/16", help="CLIP variant name (used for dim inference)")
+    p.add_argument("--dino-model", default="dinov2_vitb14", help="DINOv2/v3 architecture variant")
+    p.add_argument("--clip-ckpt", default=None, help="Local CLIP checkpoint path (.pt)")
+    p.add_argument("--dino-ckpt", default=None, help="Local DINOv2/v3 checkpoint path (.pth/.pt)")
+    p.add_argument("--checkpoint", default=None, help="Path to SSVP head checkpoint (.pt)")
     p.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     p.add_argument("--threshold", type=float, default=0.5, help="Anomaly score threshold for printing")
     return p.parse_args()
@@ -171,7 +269,10 @@ def main():
     print(f"[info] Device: {device}")
     print(f"[info] Class name: '{args.class_name}'")
 
-    model = build_model(args.clip_model, args.dino_model, args.checkpoint, device)
+    model = build_model(
+        args.clip_model, args.dino_model, args.checkpoint, device,
+        clip_ckpt=args.clip_ckpt, dino_ckpt=args.dino_ckpt,
+    )
     clip_tf, dino_tf = build_transforms(args.image_size)
 
     for img_path in args.images:
