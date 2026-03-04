@@ -39,12 +39,110 @@ import os
 from pathlib import Path
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
 from models import SSVP, SSVPConfig
 from utils import apply_colormap, postprocess_map
+
+
+# ---------------------------------------------------------------------------
+# HuggingFace CLIP adapter
+# Wraps a HuggingFace CLIPModel to expose the OpenAI CLIP interface that
+# SSVP's _extract_clip_patch_tokens() expects.
+# ---------------------------------------------------------------------------
+
+class _HFVisualNamespace:
+    """
+    Non-module namespace that mimics openai/CLIP's `model.visual` attribute.
+
+    Attribute shapes are kept identical to the OpenAI CLIP convention so that
+    SSVP._extract_clip_patch_tokens() works without modification.
+
+    Attribute    OpenAI shape          HuggingFace source
+    ------------ --------------------- ---------------------------------
+    conv1        Conv2d(3,C,p,p)       vision_model.embeddings.patch_embedding
+    class_emb    (C,)                  vision_model.embeddings.class_embedding
+                                       [HF stores as (1,1,C) → squeezed]
+    pos_embed    (N+1, C)              vision_model.embeddings.position_embedding.weight
+    ln_pre       LayerNorm(C)          vision_model.pre_layrnorm
+    transformer  callable (B,N,C)→     vision_model.encoder (wrapped)
+                 (B,N,C)
+    ln_post      LayerNorm(C)          vision_model.post_layernorm
+    proj         (C, embed_dim) or     visual_projection.weight.T
+                 None
+    """
+
+    def __init__(self, hf_clip: nn.Module) -> None:
+        vm = hf_clip.vision_model
+        self.conv1          = vm.embeddings.patch_embedding
+        self._cls_param     = vm.embeddings.class_embedding   # (1,1,C) or (C,)
+        self._pos_emb_table = vm.embeddings.position_embedding
+        self.ln_pre         = vm.pre_layrnorm
+        self.ln_post        = vm.post_layernorm
+        self._encoder       = vm.encoder
+        self._vp            = getattr(hf_clip, "visual_projection", None)
+
+    # --- properties give OpenAI-compatible shapes at access time ----
+
+    @property
+    def class_embedding(self) -> torch.Tensor:
+        """Returns (C,) — same shape as openai/CLIP class_embedding."""
+        return self._cls_param.view(-1)
+
+    @property
+    def positional_embedding(self) -> torch.Tensor:
+        """Returns (N+1, C) — same shape as openai/CLIP positional_embedding."""
+        return self._pos_emb_table.weight
+
+    @property
+    def proj(self):
+        """Returns (C, embed_dim) matrix or None, matching openai/CLIP."""
+        if self._vp is None:
+            return None
+        return self._vp.weight.T   # Linear.weight is (out, in) → T gives (in, out)
+
+    def transformer(self, x: torch.Tensor) -> torch.Tensor:
+        """Call HF encoder and return (B, N, C), identical to OpenAI Transformer."""
+        return self._encoder(inputs_embeds=x).last_hidden_state
+
+
+class CLIPHFAdapter(nn.Module):
+    """
+    Wraps a HuggingFace ``CLIPModel`` to expose the openai/CLIP interface
+    required by SSVP:
+
+    * ``model.encode_text(tokens)``   — same token IDs (identical BPE vocab)
+    * ``model.visual``                — _HFVisualNamespace with OpenAI-compatible attrs
+
+    Args:
+        hf_model: A ``transformers.CLIPModel`` instance.
+    """
+
+    def __init__(self, hf_model: nn.Module) -> None:
+        super().__init__()
+        self._hf    = hf_model
+        self.visual = _HFVisualNamespace(hf_model)
+
+    def encode_text(self, tokens: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            tokens: (B, 77) integer tensor from ``openai.clip.tokenize()``.
+                    Token IDs are identical between openai/CLIP and HuggingFace
+                    CLIPTokenizer (same BPE vocabulary).
+        Returns:
+            (B, embed_dim) unnormalised text embeddings.
+        """
+        attention_mask = (tokens != 0).long()
+        return self._hf.get_text_features(
+            input_ids=tokens,
+            attention_mask=attention_mask,
+        )
+
+    def parameters(self, recurse: bool = True):
+        return self._hf.parameters(recurse)
 
 
 # ---------------------------------------------------------------------------
@@ -83,25 +181,46 @@ def load_clip(
     local_ckpt: str | None = None,
 ) -> nn.Module:
     """
-    Load a CLIP model.
+    Load a CLIP model.  Two local formats are supported:
 
-    If *local_ckpt* is given it is passed directly to ``clip.load()`` as the
-    model path — the openai/CLIP library accepts both hub model names and
-    local ``.pt`` file paths via the same argument.
+    **OpenAI format** (``.pt`` file) — default for the official openai/CLIP
+    release.  Detected when *local_ckpt* is a file path ending in ``.pt``.
+
+    **HuggingFace format** (directory) — all files downloaded from
+    ``openai/clip-vit-base-patch16`` (or any CLIP model) on the HuggingFace
+    Hub.  Detected when *local_ckpt* is a directory containing ``config.json``.
+    Returns a :class:`CLIPHFAdapter` that exposes the openai/CLIP API.
 
     Args:
-        model_name:  Hub variant used only to infer feature dimensions when
+        model_name:  Hub variant name, used only for dimension inference when
                      *local_ckpt* is also supplied (e.g. ``"ViT-B/16"``).
         device:      Target device.
-        local_ckpt:  Optional path to a local CLIP ``.pt`` file.
+        local_ckpt:  Optional path to a local ``.pt`` file **or** a directory
+                     containing HuggingFace model files.
     """
+    if local_ckpt and Path(local_ckpt).is_dir():
+        # ---------- HuggingFace model directory ----------
+        try:
+            from transformers import CLIPModel
+        except ImportError:
+            raise ImportError(
+                "transformers is required to load a HuggingFace CLIP directory. "
+                "Install it with: pip install transformers"
+            )
+        hf_model = CLIPModel.from_pretrained(local_ckpt).to(device)
+        hf_model.eval()
+        adapter = CLIPHFAdapter(hf_model)
+        print(f"[info] Loaded CLIP (HuggingFace format) from: {local_ckpt}")
+        return adapter
+
+    # ---------- OpenAI CLIP .pt file or hub download ----------
     import clip as openai_clip
 
     load_arg = local_ckpt if local_ckpt else model_name
     model, _ = openai_clip.load(load_arg, device=device)
     model.eval()
     if local_ckpt:
-        print(f"[info] Loaded CLIP from local checkpoint: {local_ckpt}")
+        print(f"[info] Loaded CLIP (OpenAI format) from: {local_ckpt}")
     return model
 
 
@@ -111,28 +230,41 @@ def load_dino(
     local_ckpt: str | None = None,
 ) -> nn.Module:
     """
-    Load a DINOv2 / DINOv3 model.
+    Load a DINOv3 model (``facebookresearch/dinov3``).
 
-    Without *local_ckpt*: downloads from ``facebookresearch/dinov2`` hub.
+    DINOv3 hub API accepts a ``weights=`` parameter that can be a local path
+    or a URL, so in most cases you only need to pass *local_ckpt* and the hub
+    will handle the rest.  As a fallback, three file formats are supported:
 
-    With *local_ckpt*: inspects the file format and handles three cases:
-      1. Full serialised ``nn.Module``  → loaded directly.
-      2. Plain ``state_dict``           → architecture created from hub
-         (pretrained=False) then weights loaded.
-      3. Wrapped dict ``{"model": ...}`` or ``{"state_dict": ...}``
-         → same as case 2 after unwrapping.
+      1. Full serialised ``nn.Module``         → loaded directly.
+      2. Plain ``state_dict``                  → architecture skeleton built
+         from the hub (weights=None) then weights injected.
+      3. Wrapped dict ``{"model": ...}`` or    → same as case 2 after
+         ``{"state_dict": ...}``                 unwrapping.
 
     Args:
-        model_name:  Hub model name used to build the architecture when a
-                     bare state_dict is provided (e.g. ``"dinov2_vitb14"``).
+        model_name:  DINOv3 hub model name (e.g. ``"dinov3_vitb16"``).
         device:      Target device.
         local_ckpt:  Optional path to a local ``.pth`` / ``.pt`` file.
     """
+    _HUB = "facebookresearch/dinov3"
+
     if local_ckpt is None:
-        model = torch.hub.load("facebookresearch/dinov2", model_name)
+        # Download default pretrained weights from the hub
+        model = torch.hub.load(_HUB, model_name)
         model.eval().to(device)
         return model
 
+    # --- DINOv3 hub can load the weights directly via weights= parameter ---
+    try:
+        model = torch.hub.load(_HUB, model_name, weights=local_ckpt)
+        model.eval().to(device)
+        print(f"[info] Loaded DINOv3 via hub weights= from: {local_ckpt}")
+        return model
+    except Exception as e:
+        print(f"[warn] DINOv3 hub weights= failed ({e}), falling back to manual load.")
+
+    # --- Manual fallback: inspect checkpoint format ---
     checkpoint = torch.load(local_ckpt, map_location=device)
 
     # Case 1: full serialised model
@@ -146,7 +278,7 @@ def load_dino(
         state_dict = (
             checkpoint.get("model")
             or checkpoint.get("state_dict")
-            or checkpoint          # assume the dict itself is a state_dict
+            or checkpoint   # assume the dict itself is a flat state_dict
         )
     else:
         raise ValueError(
@@ -155,9 +287,7 @@ def load_dino(
         )
 
     # Build architecture skeleton without pretrained weights
-    model = torch.hub.load(
-        "facebookresearch/dinov2", model_name, pretrained=False
-    )
+    model = torch.hub.load(_HUB, model_name, weights=None)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         print(f"[warn] DINOv3 missing keys ({len(missing)}): {missing[:3]}{'…' if len(missing) > 3 else ''}")
@@ -249,9 +379,9 @@ def parse_args():
     p.add_argument("--images", nargs="+", required=True, help="Input image path(s)")
     p.add_argument("--class-name", default="object", help="Object category (inserted into prompts)")
     p.add_argument("--output-dir", default="results", help="Directory for output images and scores")
-    p.add_argument("--image-size", type=int, default=518, help="Input resolution (square)")
+    p.add_argument("--image-size", type=int, default=512, help="Input resolution (square, must be multiple of 16 for DINOv3)")
     p.add_argument("--clip-model", default="ViT-B/16", help="CLIP variant name (used for dim inference)")
-    p.add_argument("--dino-model", default="dinov2_vitb14", help="DINOv2/v3 architecture variant")
+    p.add_argument("--dino-model", default="dinov3_vitb16", help="DINOv3 architecture variant (e.g. dinov3_vitb16, dinov3_vitl16)")
     p.add_argument("--clip-ckpt", default=None, help="Local CLIP checkpoint path (.pt)")
     p.add_argument("--dino-ckpt", default=None, help="Local DINOv2/v3 checkpoint path (.pth/.pt)")
     p.add_argument("--checkpoint", default=None, help="Path to SSVP head checkpoint (.pt)")

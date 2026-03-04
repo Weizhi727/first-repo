@@ -497,12 +497,14 @@ def parse_args():
     # --- data ---
     p.add_argument("--data-root",   required=True, help="Dataset root (MVTec-AD style)")
     p.add_argument("--category",    required=True, help="Category name (e.g. 'bottle')")
-    p.add_argument("--image-size",  type=int, default=518)
+    p.add_argument("--image-size",  type=int, default=512,
+                   help="Input resolution (must be a multiple of 16 for DINOv3)")
     p.add_argument("--num-workers", type=int, default=4)
 
     # --- backbone ---
     p.add_argument("--clip-model", default="ViT-B/16")
-    p.add_argument("--dino-model", default="dinov2_vitb14")
+    p.add_argument("--dino-model", default="dinov3_vitb16",
+                   help="DINOv3 hub model name (e.g. dinov3_vitb16, dinov3_vitl16)")
     p.add_argument("--clip-ckpt",  default=None, help="Local CLIP checkpoint (.pt)")
     p.add_argument("--dino-ckpt",  default=None, help="Local DINOv3 checkpoint (.pth)")
 
