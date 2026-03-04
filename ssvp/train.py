@@ -403,26 +403,94 @@ def evaluate(
     return {"image_auroc": image_auroc, "pixel_auroc": pixel_auroc}
 
 
+@torch.no_grad()
+def evaluate_multi(
+    model: nn.Module,
+    val_loaders: dict[str, DataLoader],
+    device: torch.device,
+) -> dict:
+    """
+    Evaluate on every category in ``val_loaders`` and return macro-averaged
+    Image-AUROC and Pixel-AUROC plus per-category breakdown.
+    """
+    per_cat: dict[str, dict] = {}
+    for cat, loader in val_loaders.items():
+        per_cat[cat] = evaluate(model, loader, cat, device)
+
+    avg_img = float(np.mean([m["image_auroc"] for m in per_cat.values()]))
+    avg_pix = float(np.mean([m["pixel_auroc"] for m in per_cat.values()]))
+    return {"image_auroc": avg_img, "pixel_auroc": avg_pix, "per_category": per_cat}
+
+
+# ===========================================================================
+# Multi-category iterator
+# ===========================================================================
+
+class _MultiCatIter:
+    """
+    Infinite iterator that randomly cycles through per-category DataLoaders,
+    yielding ``(batch, class_name)`` tuples.
+
+    Used for multi-category training so that one shared set of SSVP head
+    weights learns general anomaly patterns from all source categories in a
+    single training run, producing a single checkpoint.
+
+    Steps per epoch = total training images across all categories / batch_size.
+    """
+
+    def __init__(
+        self,
+        loaders: dict[str, DataLoader],
+        steps_per_epoch: int,
+    ) -> None:
+        self.loaders  = loaders
+        self.steps    = steps_per_epoch
+        self.cats     = list(loaders.keys())
+        self._refresh()
+
+    def _refresh(self) -> None:
+        self._iters = {cat: iter(ldr) for cat, ldr in self.loaders.items()}
+
+    def __len__(self) -> int:
+        return self.steps
+
+    def __iter__(self):
+        self._refresh()
+        for _ in range(self.steps):
+            cat = random.choice(self.cats)
+            try:
+                batch = next(self._iters[cat])
+            except StopIteration:
+                self._iters[cat] = iter(self.loaders[cat])
+                batch = next(self._iters[cat])
+            yield batch, cat
+
+
 # ===========================================================================
 # Training loop
 # ===========================================================================
 
 def train_one_epoch(
     model: nn.Module,
-    loader: DataLoader,
+    iterator,            # _MultiCatIter  OR  ((batch, cls) for batch in loader)
     optimizer: torch.optim.Optimizer,
-    class_name: str,
     device: torch.device,
     cfg: dict,
     epoch: int,
 ) -> dict[str, float]:
+    """
+    One training epoch.
+
+    ``iterator`` must yield ``(batch_dict, class_name)`` tuples so that the
+    class name can vary per step in multi-category mode.
+    """
     model.train()
     stats: dict[str, list[float]] = {
         "loss_total": [], "loss_align": [], "loss_pixel": [],
         "loss_kl": [], "loss_margin": [],
     }
 
-    for step, batch in enumerate(loader):
+    for step, (batch, class_name) in enumerate(iterator):
         normal_img  = batch["normal_image"].to(device)   # (B, 3, H, W)
         anomaly_img = batch["anomaly_image"].to(device)  # (B, 3, H, W)
         syn_mask    = batch["syn_mask"].to(device)       # (B, H, W)
@@ -475,8 +543,9 @@ def train_one_epoch(
 
         if (step + 1) % cfg["log_interval"] == 0:
             avg = {k: np.mean(v[-cfg["log_interval"]:]) for k, v in stats.items()}
+            n_steps = len(iterator) if hasattr(iterator, "__len__") else "?"
             print(
-                f"  epoch {epoch+1} step {step+1}/{len(loader)} | "
+                f"  epoch {epoch+1} step {step+1}/{n_steps} [{class_name}] | "
                 f"total={avg['loss_total']:.4f}  "
                 f"align={avg['loss_align']:.4f}  "
                 f"pixel={avg['loss_pixel']:.4f}  "
@@ -496,7 +565,10 @@ def parse_args():
 
     # --- data ---
     p.add_argument("--data-root",   required=True, help="Dataset root (MVTec-AD style)")
-    p.add_argument("--category",    required=True, help="Category name (e.g. 'bottle')")
+    p.add_argument("--category",    default=None,
+                   help="Single category to train on (e.g. 'bottle'). "
+                        "Omit to train on ALL categories found in --data-root "
+                        "(standard ZSAD protocol: one shared checkpoint).")
     p.add_argument("--image-size",  type=int, default=512,
                    help="Input resolution (must be a multiple of 16 for DINOv3)")
     p.add_argument("--num-workers", type=int, default=4)
@@ -557,25 +629,75 @@ def main():
     print(f"[info] Trainable parameters: "
           f"{sum(p.numel() for _, p in model.trainable_parameters()):,}")
 
-    # --- Datasets & loaders ---
+    # -----------------------------------------------------------------------
+    # Resolve training categories
+    # -----------------------------------------------------------------------
     augmentor = PerlinAnomalyAugmentor(image_size=args.image_size)
 
-    train_ds = MVTecDataset(args.data_root, args.category, "train",
-                            args.image_size, augmentor=augmentor)
-    val_ds   = MVTecDataset(args.data_root, args.category, "val",
-                            args.image_size)
+    if args.category:
+        # ── Single-category mode ─────────────────────────────────────────
+        categories    = [args.category]
+        multi_mode    = False
+        ckpt_tag      = args.category
+    else:
+        # ── Multi-category mode: auto-discover all valid category dirs ───
+        data_root = Path(args.data_root)
+        categories = sorted([
+            d.name for d in data_root.iterdir()
+            if d.is_dir() and (d / "train" / "good").exists()
+        ])
+        if not categories:
+            raise RuntimeError(
+                f"No valid category directories found in {args.data_root}. "
+                "Each category must contain train/good/."
+            )
+        multi_mode = True
+        ckpt_tag   = "multicategory"
+        print(f"[info] Multi-category mode — {len(categories)} categories: "
+              f"{', '.join(categories)}")
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                              shuffle=True,  num_workers=args.num_workers,
-                              pin_memory=True, drop_last=True)
-    val_loader   = DataLoader(val_ds,   batch_size=args.batch_size,
-                              shuffle=False, num_workers=args.num_workers,
-                              pin_memory=True)
+    # ── Build per-category datasets and loaders ───────────────────────────
+    train_loaders: dict[str, DataLoader] = {}
+    val_loaders:   dict[str, DataLoader] = {}
+    total_train = 0
 
-    print(f"[info] Train: {len(train_ds)} normal images | "
-          f"Val: {len(val_ds)} images")
+    for cat in categories:
+        tr_ds = MVTecDataset(args.data_root, cat, "train",
+                             args.image_size, augmentor=augmentor)
+        va_ds = MVTecDataset(args.data_root, cat, "val",
+                             args.image_size)
+        train_loaders[cat] = DataLoader(
+            tr_ds, batch_size=args.batch_size,
+            shuffle=True, num_workers=args.num_workers,
+            pin_memory=True, drop_last=True,
+        )
+        val_loaders[cat] = DataLoader(
+            va_ds, batch_size=args.batch_size,
+            shuffle=False, num_workers=args.num_workers,
+            pin_memory=True,
+        )
+        total_train += len(tr_ds)
+        print(f"  [{cat}] train={len(tr_ds)}  val={len(va_ds)}")
 
-    # --- Optimizer & scheduler ---
+    print(f"[info] Total training images: {total_train}")
+
+    # Steps per epoch = total images / batch_size (same wall-time regardless of mode)
+    steps_per_epoch = max(1, total_train // args.batch_size)
+
+    # ── Build training iterator ───────────────────────────────────────────
+    if multi_mode:
+        train_iter = _MultiCatIter(train_loaders, steps_per_epoch)
+    else:
+        _loader = train_loaders[categories[0]]
+        _cat    = categories[0]
+        train_iter = (  # simple generator that wraps the single loader
+            (batch, _cat) for batch in _loader
+        )
+        steps_per_epoch = len(_loader)
+
+    # -----------------------------------------------------------------------
+    # Optimizer & scheduler
+    # -----------------------------------------------------------------------
     trainable = [p for _, p in model.trainable_parameters()]
     optimizer = torch.optim.AdamW(trainable, lr=args.lr,
                                   weight_decay=args.weight_decay)
@@ -593,61 +715,83 @@ def main():
     }
 
     best_pixel_auroc = 0.0
-    best_ckpt_path   = out_dir / f"ssvp_{args.category}_best.pt"
+    best_ckpt_path   = out_dir / f"ssvp_{ckpt_tag}_best.pt"
+    last_ckpt_path   = out_dir / f"ssvp_{ckpt_tag}_last.pt"
 
+    mode_str = f"{len(categories)} categories" if multi_mode else categories[0]
     print(f"\n{'='*60}")
-    print(f"  Training SSVP  |  category: {args.category}  |  device: {device}")
-    print(f"  epochs={args.epochs}  batch={args.batch_size}  lr={args.lr}  τ={args.tau}")
+    print(f"  Training SSVP  |  {mode_str}  |  device: {device}")
+    print(f"  epochs={args.epochs}  batch={args.batch_size}  "
+          f"lr={args.lr}  τ={args.tau}  steps/epoch={steps_per_epoch}")
     print(f"{'='*60}\n")
 
+    # -----------------------------------------------------------------------
+    # Training loop
+    # -----------------------------------------------------------------------
     for epoch in range(args.epochs):
-        train_stats = train_one_epoch(
-            model, train_loader, optimizer, args.category, device, cfg, epoch
-        )
+        # Rebuild iterator at each epoch (generators exhaust after one pass)
+        if multi_mode:
+            train_iter = _MultiCatIter(train_loaders, steps_per_epoch)
+        else:
+            train_iter = ((batch, _cat) for batch in _loader)
+
+        train_stats = train_one_epoch(model, train_iter, optimizer, device, cfg, epoch)
         scheduler.step()
 
-        metrics = evaluate(model, val_loader, args.category, device)
+        # ── Validation ────────────────────────────────────────────────────
+        if multi_mode:
+            metrics = evaluate_multi(model, val_loaders, device)
+            # Print per-category breakdown
+            for cat, m in metrics["per_category"].items():
+                print(f"  [{cat}] Image-AUROC={m['image_auroc']*100:.1f}%  "
+                      f"Pixel-AUROC={m['pixel_auroc']*100:.1f}%")
+        else:
+            metrics = evaluate(model, val_loaders[categories[0]], categories[0], device)
 
         print(
             f"Epoch {epoch+1}/{args.epochs} | "
             f"loss={train_stats['loss_total']:.4f} | "
-            f"Image-AUROC={metrics['image_auroc']*100:.1f}%  "
+            f"[avg] Image-AUROC={metrics['image_auroc']*100:.1f}%  "
             f"Pixel-AUROC={metrics['pixel_auroc']*100:.1f}%"
         )
 
+        # ── Checkpoint (save only SSVP head weights) ──────────────────────
         if metrics["pixel_auroc"] > best_pixel_auroc:
             best_pixel_auroc = metrics["pixel_auroc"]
-            # Save only the trainable SSVP heads (not the frozen backbones)
             ssvp_state = {
                 k: v for k, v in model.state_dict().items()
                 if not k.startswith("clip.") and not k.startswith("dino.")
             }
             torch.save(
                 {
-                    "epoch":        epoch + 1,
-                    "model":        ssvp_state,
-                    "metrics":      metrics,
-                    "config":       config,
-                    "args":         vars(args),
+                    "epoch":      epoch + 1,
+                    "model":      ssvp_state,
+                    "metrics":    metrics,
+                    "categories": categories,
+                    "config":     config,
+                    "args":       vars(args),
                 },
                 best_ckpt_path,
             )
             print(f"  -> Saved best checkpoint: {best_ckpt_path} "
                   f"(Pixel-AUROC={best_pixel_auroc*100:.1f}%)")
 
-    # Also save last epoch
-    last_ckpt_path = out_dir / f"ssvp_{args.category}_last.pt"
+    # Save last epoch checkpoint
     ssvp_state = {
         k: v for k, v in model.state_dict().items()
         if not k.startswith("clip.") and not k.startswith("dino.")
     }
-    torch.save({"epoch": args.epochs, "model": ssvp_state,
-                "metrics": metrics, "config": config, "args": vars(args)},
-               last_ckpt_path)
+    torch.save(
+        {"epoch": args.epochs, "model": ssvp_state, "metrics": metrics,
+         "categories": categories, "config": config, "args": vars(args)},
+        last_ckpt_path,
+    )
 
     print(f"\nDone.  Best Pixel-AUROC: {best_pixel_auroc*100:.2f}%")
     print(f"Best checkpoint : {best_ckpt_path}")
     print(f"Last checkpoint : {last_ckpt_path}")
+    if multi_mode:
+        print(f"Trained on      : {', '.join(categories)}")
 
 
 if __name__ == "__main__":

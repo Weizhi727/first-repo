@@ -210,10 +210,41 @@ SSVP 的標準零樣本評測方式：
 
 ### 在 VisA 上訓練（推薦工作流程）
 
-每次針對一個 VisA 類別訓練，訓練完成後模型可用於 MVTec-AD 的任意類別推論。
+> **訓練幾個 checkpoint？**
+>
+> | 指令寫法 | checkpoint 數量 | 說明 |
+> |----------|:--------------:|------|
+> | 省略 `--category`（**推薦**） | **1 個** | 所有類別一起訓練，模型學習通用異常特徵 |
+> | 指定 `--category pcb1` | **1 個** | 只針對 pcb1 訓練 |
+>
+> 標準 ZSAD 論文（AnomalyCLIP、VCP-CLIP 等）的做法是**所有來源類別一起訓練 → 得到一個模型**，讓模型學習與物件類別無關的通用異常感知能力。之後推論時只需更改 `--class-name` 文字提示，即可對任意新類別做零樣本偵測，不需要重新訓練。
+
+#### 方式一：全類別一起訓練（標準 ZSAD 協議）→ **1 個 checkpoint**
 
 ```bash
-# 訓練單一 VisA 類別（以 pcb1 為例）
+# 省略 --category，程式自動找出 data-root 中所有含 train/good/ 的類別目錄
+python ssvp/train.py \
+    --data-root  /path/to/VisA_converted \
+    --clip-ckpt  clip-weight/ \
+    --dino-ckpt  dino-weight/dinov3_vitb16_pretrain_lvd1689m.pth \
+    --output-dir checkpoints/visa/ \
+    --epochs     10 \
+    --batch-size 16
+```
+
+輸出（**只有 1 個** checkpoint，跨所有 12 個 VisA 類別共用）：
+
+```
+checkpoints/visa/
+├── ssvp_multicategory_best.pt   ← 驗證集 Pixel-AUROC 最高時自動儲存
+└── ssvp_multicategory_last.pt   ← 最後一個 epoch
+```
+
+每個 step 從 12 個類別中隨機抽取一個批次進行訓練；每個 epoch 結束後顯示各類別 AUROC 及跨類別平均值。
+
+#### 方式二：單一類別訓練（消融實驗 / 快速驗證）→ **1 個 checkpoint**
+
+```bash
 python ssvp/train.py \
     --data-root  /path/to/VisA_converted \
     --category   pcb1 \
@@ -222,51 +253,25 @@ python ssvp/train.py \
     --output-dir checkpoints/visa/
 ```
 
-若想訓練全部 12 個 VisA 類別（建議在 bash 中執行）：
-
-```bash
-VISA_CATEGORIES="candle capsules cashew chewinggum fryum macaroni1 macaroni2 pcb1 pcb2 pcb3 pcb4 pipe_fryum"
-
-for category in $VISA_CATEGORIES; do
-    echo "=== Training: $category ==="
-    python ssvp/train.py \
-        --data-root  /path/to/VisA_converted \
-        --category   $category \
-        --clip-ckpt  clip-weight/ \
-        --dino-ckpt  dino-weight/dinov3_vitb16_pretrain_lvd1689m.pth \
-        --output-dir checkpoints/visa/$category \
-        --epochs     10 \
-        --batch-size 16
-done
-```
-
-訓練完成後的 checkpoint 路徑：
+輸出：
 
 ```
-checkpoints/
-└── visa/
-    ├── pcb1/
-    │   ├── ssvp_pcb1_best.pt   ← Pixel-AUROC 最高的 checkpoint
-    │   └── ssvp_pcb1_last.pt   ← 最後一個 epoch
-    ├── candle/
-    └── ...
+checkpoints/visa/
+├── ssvp_pcb1_best.pt
+└── ssvp_pcb1_last.pt
 ```
 
 ---
 
-### 在 MVTec-AD 上訓練（反向協議）
+### 在 MVTec-AD 上訓練（反向協議）→ **1 個 checkpoint**
 
 ```bash
-MVTEC_CATEGORIES="bottle cable capsule carpet grid hazelnut leather metal_nut pill screw tile toothbrush transistor wood zipper"
-
-for category in $MVTEC_CATEGORIES; do
-    python ssvp/train.py \
-        --data-root  /path/to/mvtec \
-        --category   $category \
-        --clip-ckpt  clip-weight/ \
-        --dino-ckpt  dino-weight/dinov3_vitb16_pretrain_lvd1689m.pth \
-        --output-dir checkpoints/mvtec/$category
-done
+# 全類別一起訓練（省略 --category）
+python ssvp/train.py \
+    --data-root  /path/to/mvtec \
+    --clip-ckpt  clip-weight/ \
+    --dino-ckpt  dino-weight/dinov3_vitb16_pretrain_lvd1689m.pth \
+    --output-dir checkpoints/mvtec/
 ```
 
 ---

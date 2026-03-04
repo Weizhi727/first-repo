@@ -175,25 +175,41 @@ VisA_converted/
 
 ### Train on VisA → Evaluate on MVTec-AD (recommended)
 
+**How many checkpoints are produced?**
+
+| Command | Checkpoints | Notes |
+|---------|:-----------:|-------|
+| Omit `--category` (**recommended**) | **1** | All categories trained together; model learns general anomaly features |
+| Specify `--category pcb1` | **1** | Single-category training |
+
+The standard ZSAD protocol trains on **all source categories together → one shared model**, so that inference on any target category only requires changing `--class-name`.
+
 ```bash
-# Single category
+# All 12 VisA categories together → 1 checkpoint (standard ZSAD protocol)
+python ssvp/train.py \
+    --data-root  /path/to/VisA_converted \
+    --clip-ckpt  clip-weight/ \
+    --dino-ckpt  dino-weight/dinov3_vitb16_pretrain_lvd1689m.pth \
+    --output-dir checkpoints/visa/ \
+    --epochs 10 --batch-size 16
+```
+
+Output (only **1 checkpoint** shared across all 12 categories):
+
+```
+checkpoints/visa/
+├── ssvp_multicategory_best.pt   ← auto-saved at best val Pixel-AUROC
+└── ssvp_multicategory_last.pt
+```
+
+```bash
+# Single category (ablation / quick test)
 python ssvp/train.py \
     --data-root  /path/to/VisA_converted \
     --category   pcb1 \
     --clip-ckpt  clip-weight/ \
     --dino-ckpt  dino-weight/dinov3_vitb16_pretrain_lvd1689m.pth \
     --output-dir checkpoints/visa/
-
-# All 12 VisA categories
-for cat in candle capsules cashew chewinggum fryum macaroni1 macaroni2 pcb1 pcb2 pcb3 pcb4 pipe_fryum; do
-    python ssvp/train.py \
-        --data-root  /path/to/VisA_converted \
-        --category   $cat \
-        --clip-ckpt  clip-weight/ \
-        --dino-ckpt  dino-weight/dinov3_vitb16_pretrain_lvd1689m.pth \
-        --output-dir checkpoints/visa/$cat \
-        --epochs 10
-done
 ```
 
 ### Key Arguments
